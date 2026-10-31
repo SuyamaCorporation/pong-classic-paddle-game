@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ポン クラシック パドル ゲーム</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background:#000; }
+    canvas { display:block; margin:0 auto; border-radius:4px; }
+    @keyframes flash { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    .flash { animation: flash 0.3s ease; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col items-center justify-start py-4 px-2">
+
+  <h1 class="text-2xl font-bold text-white mb-1">🏓 PONG クラシック</h1>
+  <p class="text-slate-400 text-xs mb-3">↑↓ キーまたはマウスで操作 | 先に 11 点で勝利</p>
+
+  <!-- Controls row -->
+  <div class="flex flex-wrap gap-3 mb-3 items-center justify-center text-sm">
+    <label class="text-slate-300 font-semibold" for="difficulty-slider">AI 難易度:</label>
+    <input type="range" id="difficulty-slider" min="1" max="3" value="2" step="1"
+      class="accent-indigo-500 w-28" aria-label="AI難易度" oninput="updateDiffLabel(this.value)" />
+    <span id="diff-label" class="text-indigo-300 w-12">中</span>
+    <div class="bg-slate-900 rounded-lg px-4 py-1 flex gap-4">
+      <span class="text-green-400 font-mono font-bold" id="p-score">0</span>
+      <span class="text-slate-400">:</span>
+      <span class="text-red-400 font-mono font-bold" id="ai-score">0</span>
+    </div>
+    <div class="bg-slate-900 rounded-lg px-3 py-1">
+      <span class="text-yellow-300 text-xs">最高連勝: </span>
+      <span class="text-yellow-400 font-bold text-xs" id="best-streak">0</span>
+    </div>
+  </div>
+
+  <!-- Canvas -->
+  <canvas id="game" width="800" height="500"></canvas>
+
+  <!-- Mobile controls -->
+  <div class="flex gap-4 mt-4 md:hidden">
+    <button id="up-btn" class="w-16 h-16 bg-slate-700 rounded-xl text-2xl text-white active:bg-slate-500 select-none"
+      aria-label="上へ移動">▲</button>
+    <button id="down-btn" class="w-16 h-16 bg-slate-700 rounded-xl text-2xl text-white active:bg-slate-500 select-none"
+      aria-label="下へ移動">▼</button>
+  </div>
+
+  <!-- Start overlay -->
+  <div id="overlay" class="mt-4 text-center">
+    <button onclick="startGame()"
+      class="px-8 py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold text-lg transition"
+      aria-label="ゲームスタート">スタート</button>
+  </div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// Responsive
+function resize() {
+  const maxW = Math.min(800, window.innerWidth - 16);
+  canvas.style.width = maxW + 'px';
+  canvas.style.height = Math.round(maxW * 500/800) + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── Constants ──────────────────────────────────────────────
+const W = 800, H = 500;
+const PADDLE_W = 14, PADDLE_H = 80;
+const BALL_R = 8;
+const WIN_SCORE = 11;
+
+// ── State ──────────────────────────────────────────────────
+let pY, aiY, ball;
+let pScore = 0, aiScore = 0;
+let currentStreak = 0;
+let rafId = null;
+let aiDifficulty = 2; // 1=easy,2=mid,3=hard
+let phase = 'idle'; // 'idle' | 'serving' | 'playing' | 'over'
+let keys = {};
+let mouseY = H/2;
+let mobileUp = false, mobileDown = false;
+let lastWinner = null;
+
+function loadBest() { return parseInt(localStorage.getItem('pong_streak')||'0',10); }
+function saveBest(v) { localStorage.setItem('pong_streak', String(v)); }
+
+// ── Keyboard & Mouse ───────────────────────────────────────
+document.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && phase === 'playing') e.preventDefault();
+  if (e.key === ' ' && phase === 'serving') serve();
+});
+document.addEventListener('keyup', e => keys[e.key] = false);
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const scaleY = H / rect.height;
+  mouseY = (e.clientY - rect.top) * scaleY;
+});
+
+document.getElementById('up-btn').addEventListener('touchstart', e => { mobileUp=true; e.preventDefault(); }, {passive:false});
+document.getElementById('up-btn').addEventListener('touchend', e => { mobileUp=false; });
+document.getElementById('down-btn').addEventListener('touchstart', e => { mobileDown=true; e.preventDefault(); }, {passive:false});
+document.getElementById('down-btn').addEventListener('touchend', e => { mobileDown=false; });
+
+// ── AI ─────────────────────────────────────────────────────
+const AI_SPEEDS  = [0, 2.8, 4.0, 5.5];
+const AI_ERRORS  = [0, 18, 10, 3]; // max pixel error
+
+function updateAI() {
+  const speed = AI_SPEEDS[aiDifficulty];
+  const error = AI_ERRORS[aiDifficulty];
+  const targetY = ball.y + (Math.random() - 0.5) * error * 2;
+  const aiCenter = aiY + PADDLE_H/2;
+  if (Math.abs(aiCenter - targetY) > speed) {
+    aiY += aiCenter < targetY ? speed : -speed;
+  }
+  aiY = clamp(aiY, 0, H - PADDLE_H);
+}
+
+// ── Ball init ──────────────────────────────────────────────
+function initBall(toRight) {
+  const angle = (Math.random() * 0.6 - 0.3); // -0.3..+0.3 rad
+  const speed = 5.5;
+  const dir = toRight ? 1 : -1;
+  ball = {
+    x: W/2, y: H/2,
+    vx: Math.cos(angle) * speed * dir,
+    vy: Math.sin(angle) * speed,
+    speed,
+  };
+}
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ── Physics ────────────────────────────────────────────────
+function updateBall() {
+  ball.x += ball.vx;
+  ball.y += ball.vy;
+
+  // Top/bottom bounce
+  if (ball.y - BALL_R <= 0) { ball.y = BALL_R; ball.vy = Math.abs(ball.vy); }
+  if (ball.y + BALL_R >= H)  { ball.y = H - BALL_R; ball.vy = -Math.abs(ball.vy); }
+
+  // Player paddle (left)
+  if (ball.vx < 0 && ball.x - BALL_R <= 40 + PADDLE_W && ball.x - BALL_R >= 38) {
+    if (ball.y >= pY && ball.y <= pY + PADDLE_H) {
+      const relHit = (ball.y - (pY + PADDLE_H/2)) / (PADDLE_H/2);
+      const bounceAngle = relHit * 1.1;
+      ball.speed = Math.min(ball.speed + 0.25, 14);
+      ball.vx = Math.abs(Math.cos(bounceAngle) * ball.speed);
+      ball.vy = Math.sin(bounceAngle) * ball.speed;
+    }
+  }
+
+  // AI paddle (right)
+  const rx = W - 40 - PADDLE_W;
+  if (ball.vx > 0 && ball.x + BALL_R >= rx && ball.x + BALL_R <= rx + PADDLE_W + 2) {
+    if (ball.y >= aiY && ball.y <= aiY + PADDLE_H) {
+      const relHit = (ball.y - (aiY + PADDLE_H/2)) / (PADDLE_H/2);
+      const bounceAngle = relHit * 1.1;
+      ball.speed = Math.min(ball.speed + 0.25, 14);
+      ball.vx = -Math.abs(Math.cos(bounceAngle) * ball.speed);
+      ball.vy = Math.sin(bounceAngle) * ball.speed;
+    }
+  }
+
+  // Score
+  if (ball.x < -BALL_R) {
+    aiScore++;
+    document.getElementById('ai-score').textContent = aiScore;
+    currentStreak = 0;
+    checkWin('ai');
+  }
+  if (ball.x > W + BALL_R) {
+    pScore++;
+    document.getElementById('p-score').textContent = pScore;
+    currentStreak++;
+    if (currentStreak > loadBest()) saveBest(currentStreak);
+    document.getElementById('best-streak').textContent = loadBest();
+    checkWin('player');
+  }
+}
+
+function checkWin(who) {
+  if (pScore >= WIN_SCORE || aiScore >= WIN_SCORE) {
+    phase = 'over';
+    lastWinner = who;
+  } else {
+    phase = 'serving';
+    initBall(who === 'ai'); // loser serves (ball goes toward them to restart)
+  }
+}
+
+// ── Player movement ────────────────────────────────────────
+function updatePlayer() {
+  const speed = 6;
+  if (keys['ArrowUp'] || mobileUp) pY -= speed;
+  if (keys['ArrowDown'] || mobileDown) pY += speed;
+  // Mouse follow
+  const targetByMouse = mouseY - PADDLE_H/2;
+  if (!keys['ArrowUp'] && !keys['ArrowDown'] && !mobileUp && !mobileDown) {
+    const diff = targetByMouse - pY;
+    pY += clamp(diff, -speed, speed);
+  }
+  pY = clamp(pY, 0, H - PADDLE_H);
+}
+
+// ── Draw ───────────────────────────────────────────────────
+function drawField() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  // Center line
+  ctx.setLineDash([12, 10]);
+  ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(W/2, 0); ctx.lineTo(W/2, H); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function drawPaddle(x, y, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.roundRect(x, y, PADDLE_W, PADDLE_H, 4);
+  ctx.fill();
+}
+
+function drawBall() {
+  ctx.beginPath();
+  ctx.arc(ball.x, ball.y, BALL_R, 0, Math.PI*2);
+  ctx.fillStyle = '#fff';
+  ctx.fill();
+  // trail
+  ctx.beginPath();
+  ctx.arc(ball.x - ball.vx*1.5, ball.y - ball.vy*1.5, BALL_R*0.6, 0, Math.PI*2);
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.fill();
+}
+
+function drawScore() {
+  ctx.font = 'bold 48px monospace';
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  ctx.textAlign = 'right';
+  ctx.fillText(pScore, W/2 - 30, 60);
+  ctx.textAlign = 'left';
+  ctx.fillText(aiScore, W/2 + 30, 60);
+}
+
+function drawOverlay() {
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  ctx.fillRect(0,0,W,H);
+  ctx.textAlign = 'center';
+  if (phase === 'serving') {
+    ctx.font = '20px sans-serif'; ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText('スペースキーまたはクリックでサーブ', W/2, H/2 + 10);
+  } else if (phase === 'over') {
+    const msg = lastWinner === 'player' ? '🏆 あなたの勝ち！' : '💀 AI の勝ち';
+    ctx.font = 'bold 36px sans-serif'; ctx.fillStyle = lastWinner === 'player' ? '#4ade80' : '#ef4444';
+    ctx.fillText(msg, W/2, H/2 - 20);
+    ctx.font = '18px sans-serif'; ctx.fillStyle = '#fff';
+    ctx.fillText(`${pScore} - ${aiScore}`, W/2, H/2 + 18);
+    ctx.font = '14px sans-serif'; ctx.fillStyle = '#94a3b8';
+    ctx.fillText('クリックでもう一度', W/2, H/2 + 48);
+  } else if (phase === 'idle') {
+    ctx.font = 'bold 42px monospace'; ctx.fillStyle = '#fff';
+    ctx.fillText('PONG', W/2, H/2 - 10);
+    ctx.font = '18px sans-serif'; ctx.fillStyle = '#94a3b8';
+    ctx.fillText('クリックでスタート', W/2, H/2 + 28);
+  }
+}
+
+// ── Loop ───────────────────────────────────────────────────
+function loop() {
+  drawField();
+  if (phase === 'playing') {
+    updatePlayer();
+    updateAI();
+    updateBall();
+  }
+  drawPaddle(40, pY, '#4ade80');
+  drawPaddle(W - 40 - PADDLE_W, aiY, '#f87171');
+  if (phase !== 'idle') drawBall();
+  drawScore();
+  if (phase !== 'playing') drawOverlay();
+  rafId = requestAnimationFrame(loop);
+}
+
+// ── Serve & Start ──────────────────────────────────────────
+function serve() {
+  if (phase === 'serving') phase = 'playing';
+}
+
+canvas.addEventListener('click', () => {
+  if (phase === 'serving') serve();
+  else if (phase === 'over') startGame();
+  else if (phase === 'idle') startGame();
+});
+
+function startGame() {
+  pScore = 0; aiScore = 0; currentStreak = 0;
+  document.getElementById('p-score').textContent = '0';
+  document.getElementById('ai-score').textContent = '0';
+  document.getElementById('best-streak').textContent = loadBest();
+  pY = H/2 - PADDLE_H/2;
+  aiY = H/2 - PADDLE_H/2;
+  initBall(true);
+  phase = 'serving';
+  document.getElementById('overlay').innerHTML = '';
+}
+
+// ── Difficulty label ───────────────────────────────────────
+function updateDiffLabel(v) {
+  aiDifficulty = parseInt(v);
+  document.getElementById('diff-label').textContent = ['','低','中','高'][aiDifficulty];
+}
+updateDiffLabel(2);
+
+// ── Init ───────────────────────────────────────────────────
+pY = H/2 - PADDLE_H/2; aiY = H/2 - PADDLE_H/2;
+initBall(true);
+document.getElementById('best-streak').textContent = loadBest();
+if (!rafId) rafId = requestAnimationFrame(loop);
+</script>
+</body>
+</html>
